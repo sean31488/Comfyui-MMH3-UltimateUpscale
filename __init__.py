@@ -18,6 +18,7 @@ from .nodes import (
     LTX25ReferenceParams,
     LTX25ICLoRALoader,
 )
+from .nodes.auto_split import MMH3TiledDiffusionAuto, MMH3TemporalSplitParamsAuto
 
 NODE_CLASS_MAPPINGS = {
     "MMH3UltimateUpscale": MMH3UltimateUpscale,
@@ -34,6 +35,8 @@ NODE_CLASS_MAPPINGS = {
     "LTX25SpatialSplitParams": LTX25SpatialSplitParams,
     "LTX25ICLoRALoader": LTX25ICLoRALoader,
     "LTX25ReferenceParams": LTX25ReferenceParams,
+    "MMH3TiledDiffusionAuto": MMH3TiledDiffusionAuto,
+    "MMH3TemporalSplitParamsAuto": MMH3TemporalSplitParamsAuto,
 }
 
 # front-end JS: auto-show/hide tile size vs rows/cols inputs on the two
@@ -55,6 +58,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTX25SpatialSplitParams": "LTX25 Spatial Split Params",
     "LTX25ICLoRALoader": "LTX25 IC-LoRA Loader (MSR)",
     "LTX25ReferenceParams": "LTX25 Reference Params",
+    "MMH3TiledDiffusionAuto": "MMH3 Tiled Diffusion Auto (Experimental)",
+    "MMH3TemporalSplitParamsAuto": "MMH3 Temporal Split Params Auto",
 }
 
 
@@ -76,6 +81,8 @@ class MMH3UltimateUpscaleExtension(ComfyExtension):
             LTX25SpatialSplitParams,
             LTX25ReferenceParams,
             LTX25ICLoRALoader,
+            MMH3TiledDiffusionAuto,
+            MMH3TemporalSplitParamsAuto,
         ]
 
 
