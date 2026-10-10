@@ -175,10 +175,11 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
                 "Chooses the time chunk count and Tiled Diffusion tile count for "
                 "'MMH3 Ultimate Upscale' from the latent length and sampling size. "
                 "Time is split first; tiles are added only when chunks would get "
-                "shorter than min_chunk_frames. With 1 tile the model is passed "
-                "through unpatched; with 1 chunk temporal_split_param is empty, so "
-                "the sampler takes its no-split path. Leave spatial_split_param "
-                "unconnected."
+                "shorter than min_chunk_frames. With 1 tile or spatial_split off the "
+                "model is passed through unpatched; with 1 chunk or temporal_split "
+                "off temporal_split_param is empty, so the sampler takes its "
+                "no-split path. Fails when no allowed split fits token_budget. "
+                "Leave spatial_split_param unconnected."
             ),
             search_aliases=["auto split", "split planner", "h3 auto split"],
             inputs=[
@@ -189,15 +190,19 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
                 H3_UPSCALE_PARAM.Input("latent_upscale_param", optional=True,
                                        tooltip="The same latent_upscale_param fed into 'MMH3 Ultimate Upscale'. When connected, its width/height is the sampling size; otherwise the latent size is."),
                 io.Int.Input("token_budget", default=44000, min=1000, max=1000000, step=1000,
-                             tooltip="Max tokens per DiT forward (video tokens of one tile x chunk + audio). Calibrate from a run that fits in VRAM."),
-                io.Int.Input("min_chunk_frames", default=119, min=17, max=100000, step=17,
-                             tooltip="Shortest allowed time chunk in pixel frames (multiple of 17). Tiles are added instead of cutting time chunks shorter than this."),
+                             tooltip="Max tokens per DiT forward (video tokens of one tile x chunk + audio). Calibrate from a run that fits in VRAM. The workflow stops when no allowed split fits."),
+                io.Boolean.Input("spatial_split", default=True,
+                                 tooltip="Allow Tiled Diffusion tiles. Off: the model is passed through unpatched."),
                 io.Float.Input("tile_overlap_frac", default=0.5, min=0.0, max=0.5, step=0.05,
-                               tooltip="Overlap between neighbouring tiles as a fraction of the tile size."),
-                io.Float.Input("temporal_overlap_frac", default=0.25, min=0.0, max=0.5, step=0.01,
-                               tooltip="Overlap between consecutive chunks as a fraction of the chunk length."),
+                               tooltip="Overlap between neighbouring tiles as a fraction of the tile size. Unused when spatial_split is off."),
                 io.Combo.Input("method", options=["gaussian", "uniform"], default="gaussian",
                                tooltip="Tiled Diffusion overlap blending weight, used only when tiles > 1."),
+                io.Boolean.Input("temporal_split", default=True,
+                                 tooltip="Allow time chunks. Off: temporal_split_param is empty."),
+                io.Int.Input("min_chunk_frames", default=119, min=17, max=100000, step=17,
+                             tooltip="Shortest allowed time chunk in pixel frames (multiple of 17). Tiles are added instead of cutting time chunks shorter than this. Unused when temporal_split is off."),
+                io.Float.Input("temporal_overlap_frac", default=0.25, min=0.0, max=0.5, step=0.01,
+                               tooltip="Overlap between consecutive chunks as a fraction of the chunk length. Unused when temporal_split is off."),
                 io.Float.Input("anchor_strength", default=0.999, min=0.0, max=1.0, step=0.01,
                                tooltip="Frame-0 anchor strength of each time chunk, used only when chunks > 1."),
             ],
@@ -210,16 +215,17 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, latent, token_budget, min_chunk_frames, tile_overlap_frac,
-                temporal_overlap_frac, method, anchor_strength, latent_upscale_param=None) -> io.NodeOutput:
+    def execute(cls, model, latent, token_budget, spatial_split, tile_overlap_frac, method,
+                temporal_split, min_chunk_frames, temporal_overlap_frac, anchor_strength,
+                latent_upscale_param=None) -> io.NodeOutput:
         _, _, tv, H, W = latent["samples"].tensors[0].shape
         if latent_upscale_param is not None:
             H, W, _ = _compute_upscale_target(latent_upscale_param["width"], latent_upscale_param["height"], H, W)
 
         plan = None
-        for n_tiles in TILE_GRIDS:
+        for n_tiles in (TILE_GRIDS if spatial_split else ["1"]):
             tile_h, tile_w, _ = _solve_tiles(H, W, n_tiles, tile_overlap_frac)
-            for n in range(1, tv // 5 + 2):
+            for n in range(1, tv // 5 + 2 if temporal_split else 2):
                 bounds, chunk_length, overlap = _solve_temporal(tv, n, temporal_overlap_frac)
                 if len(bounds) > 1 and chunk_length < min_chunk_frames:
                     break
@@ -246,7 +252,8 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
         else:
             print(f"  temporal: {len(bounds)} chunks, {chunk_length} frames/chunk, overlap {overlap} frames")
         if tokens > token_budget:
-            print("[MMH3 Auto Split Planner] WARNING: no split fits token_budget; using the smallest one found.")
+            raise ValueError(f"MMH3 Auto Split Planner: no allowed split fits token_budget "
+                             f"(smallest needs {tokens} > {token_budget} tokens).")
 
         if n_tiles != "1":
             model = model.clone()

@@ -152,10 +152,10 @@ class _H3TiledDiffusionImpl:
                 th, tw = h1 - h0, w1 - w0
                 tiles.append((h0, w0, h1, w1))
                 if self.method == "gaussian":
-                    sigma = max(min(th, tw) / 8.0, 1e-6)
+                    sy, sx = th / 8.0, tw / 8.0
                     yy = torch.arange(th, dtype=torch.float32) - (th - 1) / 2.0
                     xx = torch.arange(tw, dtype=torch.float32) - (tw - 1) / 2.0
-                    w = torch.exp(-(yy[:, None] ** 2 + xx[None, :] ** 2) / (2.0 * sigma * sigma))
+                    w = torch.exp(-(yy[:, None] ** 2 / (2.0 * sy * sy) + xx[None, :] ** 2 / (2.0 * sx * sx)))
                 else:
                     w = torch.ones(th, tw, dtype=torch.float32)
                 weights.append(w.to(device=video.device, dtype=video.dtype))
