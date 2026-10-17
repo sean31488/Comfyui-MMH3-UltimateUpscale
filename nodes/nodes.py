@@ -418,16 +418,12 @@ def _solve_equal_tiles(total_px, count, base_overlap_px, granularity):
     return s, o
 
 
-def crop_keyframes_to_tile(cond, src_h, src_w, r0, c0, tr, tc):
+def crop_keyframes_to_tile(cond, r0, c0, tr, tc):
     """Spatially crop every keyframe's video latent to a tile of the source frame.
 
-    Keyframes whose latent already matches the source spatial size are cropped to
-    the tile's latent region. If a keyframe is at a DIFFERENT spatial scale (e.g.
-    the source was latent-upscaled before tiling, or a different VAE/resolution
-    produced the conditioning), it is resized to the source spatial size first so
-    the cropped keyframe exactly matches the tile's row count - otherwise the
-    model's cond/video row broadcast (`all_video_rows[~img_update] = cond_video_rows`)
-    fails with a shape mismatch. Audio keyframes are untouched (audio is not spatial)."""
+    Keyframes are already on the source spatial grid (reanchor_conditioning drops
+    any that are not), so each is cropped to the tile's latent region. Audio
+    keyframes are untouched (audio is not spatial)."""
     out = []
     for tensor, d in cond:
         nd = dict(d)
@@ -438,27 +434,12 @@ def crop_keyframes_to_tile(cond, src_h, src_w, r0, c0, tr, tc):
                 nkf = dict(kf)
                 lt = kf.get("latent")
                 if lt is not None:
-                    kh, kw = lt.shape[3], lt.shape[4]
-                    if kh == src_h and kw == src_w:
-                        # The model pads the target latent to the 2x2 spatial patch
-                        # grid but its cond path does not, so the cropped keyframe
-                        # must be padded to the same even grid or patchify fails.
-                        crop = lt[:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous()
-                        nkf["latent"] = comfy.ldm.common_dit.pad_to_patch_size(crop, (1, 2, 2))
-                    else:
-                        # Keyframe latent is at a different spatial scale than the
-                        # tile source. Resize it to (src_h, src_w) so the crop
-                        # produces a keyframe that matches the tile dimensions.
-                        B, C, T, H, W = lt.shape
-                        lt_r = torch.nn.functional.interpolate(
-                            lt.to(torch.float32).reshape(B * T, C, H, W),
-                            size=(src_h, src_w), mode="bilinear", align_corners=False,
-                        ).reshape(B, C, T, src_h, src_w)
-                        nkf["latent"] = comfy.ldm.common_dit.pad_to_patch_size(
-                            lt_r[:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous(), (1, 2, 2))
-                    cropped.append(nkf)
-                else:
-                    cropped.append(nkf)
+                    # The model pads the target latent to the 2x2 spatial patch
+                    # grid but its cond path does not, so the cropped keyframe
+                    # must be padded to the same even grid or patchify fails.
+                    crop = lt[:, :, :, r0:r0 + tr, c0:c0 + tc].contiguous()
+                    nkf["latent"] = comfy.ldm.common_dit.pad_to_patch_size(crop, (1, 2, 2))
+                cropped.append(nkf)
             nd["minimax_keyframes"] = cropped
         out.append([tensor, nd])
     return out
@@ -508,8 +489,10 @@ def trim_keyframe(kf, f0, f1):
 def reanchor_conditioning(cond, f0, f1, spatial=None):
     """Cut/re-anchor minimax_keyframes to the pixel-frame segment [f0, f1).
 
-    When `spatial` (latent_h, latent_w) is given, keyframe video latents whose
-    spatial size differs are resized to it (bilinear)."""
+    When `spatial` (latent_h, latent_w) is given, keyframes whose video latent
+    has another spatial size are dropped: a low-res keyframe (e.g. a Stage 1
+    take's first frame or guide) resized to the upscaled grid is a blurred
+    anchor that ghosts against the sampled frames."""
     out = []
     for tensor, d in cond:
         nd = dict(d)
@@ -517,15 +500,18 @@ def reanchor_conditioning(cond, f0, f1, spatial=None):
         if kfs:
             trimmed = [trim_keyframe(kf, f0, f1) for kf in kfs]
             trimmed = [kf for kf in trimmed if kf is not None]
+            if spatial is not None:
+                kept = []
+                for kf in trimmed:
+                    lt = kf.get("latent")
+                    if lt is None or tuple(lt.shape[3:5]) == tuple(spatial):
+                        kept.append(kf)
+                    else:
+                        print(f"[H3] frames {f0}..{f1}: dropped keyframe at frame "
+                              f"{f0 + kf['resolved_frame_index']} "
+                              f"({tuple(lt.shape[3:5])} vs {tuple(spatial)})")
+                trimmed = kept
             if trimmed:
-                if spatial is not None:
-                    for kf in trimmed:
-                        lt = kf.get("latent")
-                        if lt is not None and (lt.shape[3] != spatial[0] or lt.shape[4] != spatial[1]):
-                            B, C, T, H, W = lt.shape
-                            kf["latent"] = F.interpolate(
-                                lt.view(B * T, C, H, W), size=spatial, mode="bilinear", align_corners=False
-                            ).view(B, C, T, spatial[0], spatial[1])
                 nd["minimax_keyframes"] = trimmed
             else:
                 nd.pop("minimax_keyframes", None)
@@ -908,7 +894,7 @@ def spatial_process(chunk_v, chunk_a, cond, sp, model, noise, sampler, sigmas, n
                 "noise_mask": comfy.nested_tensor.NestedTensor((mv, ma)),
             }
 
-            cond_tile = crop_keyframes_to_tile(cond, h, w, r0, c0, tr, tc)
+            cond_tile = crop_keyframes_to_tile(cond, r0, c0, tr, tc)
             c_net = None
             if fun_control is not None:
                 # crop the per-chunk control to this tile's spatial window (per the
@@ -1567,10 +1553,10 @@ class MMH3UltimateUpscale(io.ComfyNode):
                 chunk_v, _, _ = upscale_latent(chunk_v, latent_upscale_param)
                 upscaled = True
 
-            # 2. time re-anchor; keyframe video latents are always resized to the
-            #    (possibly upscaled) chunk size - the H3 packed layout requires
-            #    keyframes on the sampled target's spatial grid, and in the intended
-            #    workflow the conditioning is generated at the upscaled size already
+            # 2. time re-anchor; keyframe video latents not on the (possibly
+            #    upscaled) chunk's spatial grid are dropped - the H3 packed layout
+            #    requires keyframes on the sampled target's grid, and a resized
+            #    low-res keyframe is a blurred anchor that ghosts
             cond_i = reanchor_conditioning(conditioning, f0, f1, (chunk_v.shape[3], chunk_v.shape[4]))
 
             # 3. pin frame-0 keyframe to the previous chunk's re-sampled frame
