@@ -519,6 +519,21 @@ def reanchor_conditioning(cond, f0, f1, spatial=None):
     return out
 
 
+def chunk_conditioning(cond, k0, k1):
+    """The conditioning of the clip an obvpm joint timeline shows most in video
+    tokens [k0, k1) (its 'H3 Joint Conditioning' table); `cond` without one.
+    The clip's keyframes keep their clip-relative frame indices."""
+    table = cond[0][1].get("obvpm_h3_joint") if cond else None
+    if not table:
+        return cond
+    owners = [o for o in table.get("owners", [])[k0:k1] if o >= 0]
+    if not owners:
+        return cond
+    j = max(sorted(set(owners)), key=owners.count)
+    print(f"[H3] tokens {k0}..{k1}: conditioning of {table['clips'][j]}")
+    return normalize_minimax_refs(table["conds"][j])
+
+
 def anchor_conditioning(cond, prev_video, f0, strength):
     """Replace the frame-0 keyframe with the previous chunk's re-sampled frame.
 
@@ -1557,7 +1572,8 @@ class MMH3UltimateUpscale(io.ComfyNode):
             #    upscaled) chunk's spatial grid are dropped - the H3 packed layout
             #    requires keyframes on the sampled target's grid, and a resized
             #    low-res keyframe is a blurred anchor that ghosts
-            cond_i = reanchor_conditioning(conditioning, f0, f1, (chunk_v.shape[3], chunk_v.shape[4]))
+            cond_i = reanchor_conditioning(chunk_conditioning(conditioning, k0, k1), f0, f1,
+                                           (chunk_v.shape[3], chunk_v.shape[4]))
 
             # 3. pin frame-0 keyframe to the previous chunk's re-sampled frame
             if i > 0 and acc_v is not None:
