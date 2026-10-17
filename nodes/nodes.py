@@ -522,16 +522,34 @@ def reanchor_conditioning(cond, f0, f1, spatial=None):
 def chunk_conditioning(cond, k0, k1):
     """The conditioning of the clip an obvpm joint timeline shows most in video
     tokens [k0, k1) (its 'H3 Joint Conditioning' table); `cond` without one.
-    The clip's keyframes keep their clip-relative frame indices."""
+    Its keyframes become those of every clip that land on frames the timeline
+    shows of that clip, at joint frame indices."""
     table = cond[0][1].get("obvpm_h3_joint") if cond else None
     if not table:
         return cond
-    owners = [o for o in table.get("owners", [])[k0:k1] if o >= 0]
+    all_owners = table.get("owners", [])
+    owners = [o for o in all_owners[k0:k1] if o >= 0]
     if not owners:
         return cond
     j = max(sorted(set(owners)), key=owners.count)
-    print(f"[H3] tokens {k0}..{k1}: conditioning of {table['clips'][j]}")
-    return normalize_minimax_refs(table["conds"][j])
+    keyframes = []
+    for c, (s, _n) in enumerate(table["spans"]):
+        # first frame of step s, also for a clip that starts before the latent (s < 0)
+        start = (s // 5) * 17 + frames_for_tokens(s % 5)
+        for kf in table["conds"][c][0][1].get("minimax_keyframes", []):
+            f = start + kf["resolved_frame_index"]
+            t = tokens_for_frames(f + 1) - 1
+            if f >= 0 and t < len(all_owners) and all_owners[t] == c:
+                keyframes.append(dict(kf, resolved_frame_index=f))
+    print(f"[H3] tokens {k0}..{k1}: conditioning of {table['clips'][j]}, "
+          f"keyframes at frames {[kf['resolved_frame_index'] for kf in keyframes]}")
+    out = []
+    for tensor, d in normalize_minimax_refs(table["conds"][j]):
+        nd = dict(d, minimax_keyframes=keyframes)
+        if not keyframes:
+            del nd["minimax_keyframes"]
+        out.append([tensor, nd])
+    return out
 
 
 def anchor_conditioning(cond, prev_video, f0, strength):
