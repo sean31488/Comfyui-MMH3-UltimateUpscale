@@ -193,6 +193,13 @@ class _H3TiledDiffusionImpl:
         print(f"[MMH3-TiledDiffusion] {len(tiles)} tiles ({len(rows)}x{len(cols)}) "
               f"on {H}x{W} latent, overlap {self.overlap * 16}px, method={self.method}, "
               f"global window positions")
+        largest = max((p["layout"] for p in payloads), key=lambda l: l.seq_len)
+        rows_by_kind = {}
+        for a, b, kind in largest.segments:
+            rows_by_kind[kind] = rows_by_kind.get(kind, 0) + b - a
+        conditioning = sum(n for kind, n in rows_by_kind.items() if kind not in ("video", "audio"))
+        print(f"[MMH3-TiledDiffusion] largest tile tokens: total {largest.seq_len}, conditioning {conditioning}, "
+              + ", ".join(f"{kind} {n}" for kind, n in rows_by_kind.items()))
         return tiles, weights, payloads
 
     def __call__(self, model_function, args):
