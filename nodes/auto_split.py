@@ -8,7 +8,8 @@ MMH3 Auto Split Planner picks both counts from a per-forward token budget.
 from comfy_api.latest import io
 
 from .h3_latent_upscaler import _compute_upscale_target
-from .nodes import H3_TEMPORAL_PARAM, H3_UPSCALE_PARAM, audio_range, compute_segments, frames_for_tokens
+from .nodes import (H3_TEMPORAL_PARAM, H3_UPSCALE_PARAM, audio_range, compute_segments, frames_for_tokens,
+                    joint_keyframes, normalize_minimax_refs, trim_keyframe)
 from .tiled_diffusion import _H3TiledDiffusionImpl, _ceil2, _tile_starts
 
 # n_tiles -> (tiles along the long edge, tiles along the short edge)
@@ -152,13 +153,52 @@ class MMH3TemporalSplitParamsAuto(io.ComfyNode):
         })
 
 
-def _max_tokens(bounds, H, W, tile_h, tile_w):
-    """Largest per-forward token count over all chunks: one tile's video tokens
-    per time token (plus the frame-0 anchor) and the chunk's audio tokens."""
+def _cond_tokens(conditioning):
+    """(text + reference tokens of the largest clip, keyframes) of the
+    conditioning fed into 'MMH3 Ultimate Upscale'; (0, None) without one."""
+    if conditioning is None:
+        return 0, None
+    table = conditioning[0][1].get("obvpm_h3_joint")
+    tokens = []
+    for cond in (table["conds"] if table else [conditioning]):
+        tensor, d = normalize_minimax_refs(cond)[0]
+        n = tensor.shape[1]
+        for blk in d.get("minimax_refs", []):
+            if blk["kind"] == "image":
+                n += (blk["latent_h"] // 2) * (blk["latent_w"] // 2)
+            elif blk["kind"] == "audio":
+                n += 2 * blk["ref_audio_t"]
+            elif blk["kind"] in ("video", "video_audio"):
+                n += blk["latent_t"] * (blk["latent_h"] // 2) * (blk["latent_w"] // 2) + 2 * blk["ref_audio_t"]
+        tokens.append(n)
+    keyframes = joint_keyframes(table) if table else conditioning[0][1].get("minimax_keyframes", [])
+    return max(tokens), keyframes
+
+
+def _max_tokens(bounds, H, W, tile_h, tile_w, cond_tokens=0, keyframes=None):
+    """Largest per-forward token count over all chunks: text and references,
+    the chunk's keyframes and frame-0 anchor on one tile, one tile's video
+    tokens per time token and the chunk's audio rows. Without keyframes
+    (no conditioning) one anchor frame is assumed."""
     per_t = (_ceil2(min(tile_h, H)) // 2) * (_ceil2(min(tile_w, W)) // 2)
-    return max((k1 - k0 + 1) * per_t + a1 - a0
-               for k0, f0, k1, f1 in bounds
-               for a0, a1 in [audio_range(f0, f1)])
+    largest = 0
+    for i, (k0, f0, k1, f1) in enumerate(bounds):
+        a0, a1 = audio_range(f0, f1)
+        n = cond_tokens + (k1 - k0) * per_t + 2 * (a1 - a0)
+        if keyframes is None:
+            n += per_t
+        else:
+            # as reanchor_conditioning / anchor_conditioning in the sampler
+            kfs = [trim_keyframe(kf, f0, f1) for kf in keyframes]
+            kfs = [kf for kf in kfs if kf is not None
+                   and (kf.get("latent") is None or tuple(kf["latent"].shape[3:5]) == (H, W))]
+            if i > 0:
+                kfs = [kf for kf in kfs if kf["resolved_frame_index"] != 0 or "latent" not in kf]
+                n += per_t
+            n += sum(kf["latent"].shape[2] * per_t for kf in kfs if "latent" in kf)
+            n += sum(2 * kf["audio_latent"].shape[-1] for kf in kfs if "audio_latent" in kf)
+        largest = max(largest, n)
+    return largest
 
 
 class MMH3AutoSplitPlanner(io.ComfyNode):
@@ -189,8 +229,10 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
                                 tooltip="The same MiniMax H3 AV latent fed into 'MMH3 Ultimate Upscale'."),
                 H3_UPSCALE_PARAM.Input("latent_upscale_param", optional=True,
                                        tooltip="The same latent_upscale_param fed into 'MMH3 Ultimate Upscale'. When connected, its width/height is the sampling size; otherwise the latent size is."),
+                io.Conditioning.Input("conditioning", optional=True,
+                                      tooltip="The same positive conditioning fed into 'MMH3 Ultimate Upscale'. When connected, its text, references and keyframes count toward token_budget."),
                 io.Int.Input("token_budget", default=44000, min=1000, max=1000000, step=1000,
-                             tooltip="Max tokens per DiT forward (video tokens of one tile x chunk + audio). Calibrate from a run that fits in VRAM. The workflow stops when no allowed split fits."),
+                             tooltip="Max tokens per DiT forward (text, references and keyframes when conditioning is connected, one tile x chunk of video, audio). Calibrate from a run that fits in VRAM. The workflow stops when no allowed split fits."),
                 io.Boolean.Input("spatial_split", default=True,
                                  tooltip="Allow Tiled Diffusion tiles. Off: the model is passed through unpatched."),
                 io.Float.Input("tile_overlap_frac", default=0.5, min=0.0, max=0.5, step=0.05,
@@ -217,10 +259,11 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
     @classmethod
     def execute(cls, model, latent, token_budget, spatial_split, tile_overlap_frac, method,
                 temporal_split, min_chunk_frames, temporal_overlap_frac, anchor_strength,
-                latent_upscale_param=None) -> io.NodeOutput:
+                latent_upscale_param=None, conditioning=None) -> io.NodeOutput:
         _, _, tv, H, W = latent["samples"].tensors[0].shape
         if latent_upscale_param is not None:
             H, W, _ = _compute_upscale_target(latent_upscale_param["width"], latent_upscale_param["height"], H, W)
+        cond_tokens, keyframes = _cond_tokens(conditioning)
 
         plan = None
         for n_tiles in (TILE_GRIDS if spatial_split else ["1"]):
@@ -229,7 +272,7 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
                 bounds, chunk_length, overlap = _solve_temporal(tv, n, temporal_overlap_frac)
                 if len(bounds) > 1 and chunk_length < min_chunk_frames:
                     break
-                tokens = _max_tokens(bounds, H, W, tile_h, tile_w)
+                tokens = _max_tokens(bounds, H, W, tile_h, tile_w, cond_tokens, keyframes)
                 if plan is None or tokens < plan[0]:
                     plan = (tokens, n_tiles, bounds, chunk_length, overlap)
                 if tokens <= token_budget:

@@ -519,19 +519,10 @@ def reanchor_conditioning(cond, f0, f1, spatial=None):
     return out
 
 
-def chunk_conditioning(cond, k0, k1):
-    """The conditioning of the clip an obvpm joint timeline shows most in video
-    tokens [k0, k1) (its 'H3 Joint Conditioning' table); `cond` without one.
-    Its keyframes become those of every clip that land on frames the timeline
-    shows of that clip, at joint frame indices."""
-    table = cond[0][1].get("obvpm_h3_joint") if cond else None
-    if not table:
-        return cond
-    all_owners = table.get("owners", [])
-    owners = [o for o in all_owners[k0:k1] if o >= 0]
-    if not owners:
-        return cond
-    j = max(sorted(set(owners)), key=owners.count)
+def joint_keyframes(table):
+    """Keyframes of every clip of an obvpm joint table that land on frames the
+    timeline shows of that clip, at joint frame indices."""
+    owners = table.get("owners", [])
     keyframes = []
     for c, (s, _n) in enumerate(table["spans"]):
         # first frame of step s, also for a clip that starts before the latent (s < 0)
@@ -539,8 +530,23 @@ def chunk_conditioning(cond, k0, k1):
         for kf in table["conds"][c][0][1].get("minimax_keyframes", []):
             f = start + kf["resolved_frame_index"]
             t = tokens_for_frames(f + 1) - 1
-            if f >= 0 and t < len(all_owners) and all_owners[t] == c:
+            if f >= 0 and t < len(owners) and owners[t] == c:
                 keyframes.append(dict(kf, resolved_frame_index=f))
+    return keyframes
+
+
+def chunk_conditioning(cond, k0, k1):
+    """The conditioning of the clip an obvpm joint timeline shows most in video
+    tokens [k0, k1) (its 'H3 Joint Conditioning' table); `cond` without one.
+    Its keyframes become those of joint_keyframes."""
+    table = cond[0][1].get("obvpm_h3_joint") if cond else None
+    if not table:
+        return cond
+    owners = [o for o in table.get("owners", [])[k0:k1] if o >= 0]
+    if not owners:
+        return cond
+    j = max(sorted(set(owners)), key=owners.count)
+    keyframes = joint_keyframes(table)
     print(f"[H3] tokens {k0}..{k1}: conditioning of {table['clips'][j]}, "
           f"keyframes at frames {[kf['resolved_frame_index'] for kf in keyframes]}")
     out = []
