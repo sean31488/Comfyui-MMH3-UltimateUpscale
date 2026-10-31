@@ -126,6 +126,8 @@ class _H3TiledDiffusionImpl:
         # (payload, video shape) -> (tiles, weights, per-tile payloads); rebuilt
         # when the conditioning payload or the chunk shape changes
         self._cache = None
+        # payloads whose tile tokens were already logged (cond and uncond)
+        self._logged = []
 
     def _build(self, payload, video, audio, c):
         _, _, T, H, W = video.shape
@@ -190,8 +192,13 @@ class _H3TiledDiffusionImpl:
                 p["layout"] = _WindowLayout(full, keyframes, T, Hp, Wp,
                                             h0, w0, h1, w1, audio_t, text_len)
                 payloads.append(p)
+        # with CFG the cond / uncond payloads alternate and rebuild every step;
+        # log each sampling run's payload once
+        if any(q is payload for q in self._logged):
+            return tiles, weights, payloads
+        self._logged = self._logged[-1:] + [payload]
         print(f"[MMH3-TiledDiffusion] {len(tiles)} tiles ({len(rows)}x{len(cols)}) "
-              f"on {H}x{W} latent, overlap {self.overlap * 16}px, method={self.method}, "
+              f"on {T}x{H}x{W} latent, overlap {self.overlap * 16}px, method={self.method}, "
               f"global window positions")
         largest = max((p["layout"] for p in payloads), key=lambda l: l.seq_len)
         rows_by_kind = {}
