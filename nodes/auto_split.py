@@ -175,30 +175,46 @@ def _cond_tokens(conditioning):
     return max(tokens), keyframes
 
 
-def _max_tokens(bounds, H, W, tile_h, tile_w, cond_tokens=0, keyframes=None):
-    """Largest per-forward token count over all chunks: text and references,
-    the chunk's keyframes and frame-0 anchor on one tile, one tile's video
-    tokens per time token and the chunk's audio rows. Without keyframes
-    (no conditioning) one anchor frame is assumed."""
+def _chunk_tokens(bounds, H, W, tile_h, tile_w, cond_tokens=0, keyframes=None):
+    """Per-chunk (text + references, keyframes + frame-0 anchor, video, audio)
+    token counts of one tile's DiT forward. Without keyframes (no
+    conditioning) one anchor frame is assumed."""
     per_t = (_ceil2(min(tile_h, H)) // 2) * (_ceil2(min(tile_w, W)) // 2)
-    largest = 0
+    out = []
     for i, (k0, f0, k1, f1) in enumerate(bounds):
         a0, a1 = audio_range(f0, f1)
-        n = cond_tokens + (k1 - k0) * per_t + 2 * (a1 - a0)
         if keyframes is None:
-            n += per_t
+            kf_n = per_t
         else:
             # as reanchor_conditioning / anchor_conditioning in the sampler
             kfs = [trim_keyframe(kf, f0, f1) for kf in keyframes]
             kfs = [kf for kf in kfs if kf is not None
                    and (kf.get("latent") is None or tuple(kf["latent"].shape[3:5]) == (H, W))]
+            kf_n = 0
             if i > 0:
                 kfs = [kf for kf in kfs if kf["resolved_frame_index"] != 0 or "latent" not in kf]
-                n += per_t
-            n += sum(kf["latent"].shape[2] * per_t for kf in kfs if "latent" in kf)
-            n += sum(2 * kf["audio_latent"].shape[-1] for kf in kfs if "audio_latent" in kf)
-        largest = max(largest, n)
-    return largest
+                kf_n += per_t
+            kf_n += sum(kf["latent"].shape[2] * per_t for kf in kfs if "latent" in kf)
+            kf_n += sum(2 * kf["audio_latent"].shape[-1] for kf in kfs if "audio_latent" in kf)
+        out.append((cond_tokens, kf_n, (k1 - k0) * per_t, 2 * (a1 - a0)))
+    return out
+
+
+# Fixed per-forward time expressed in tokens: per tile per step, time ~
+# c + beta * N^2 with c ~ 4.1 s, beta ~ 0.0120 s/(1k tok)^2, fitted on a 12 GB
+# RTX 3080 Ti (25k-90k tokens per tile). sqrt(c / beta) ~ 18.5k tokens.
+_FORWARD_FIXED_TOKENS = 18500
+
+# Estimated times within this fraction count as equal (measured estimate error
+# ~17%: 2 vs 3 vs 6 tiles at 153-frame chunks ran within noise of each other):
+# a better-quality plan that close replaces a faster one.
+_NEAR_TIE = 0.20
+
+
+def _plan_cost(tile_count, per_chunk):
+    """Relative sampling time of a plan: every tile forward costs a fixed part
+    plus a part quadratic in its tokens, summed over tiles and chunks."""
+    return tile_count * sum(sum(p) ** 2 + _FORWARD_FIXED_TOKENS ** 2 for p in per_chunk)
 
 
 class MMH3AutoSplitPlanner(io.ComfyNode):
@@ -233,6 +249,8 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
                                       tooltip="The same positive conditioning fed into 'MMH3 Ultimate Upscale'. When connected, its text, references and keyframes count toward token_budget."),
                 io.Int.Input("token_budget", default=44000, min=1000, max=1000000, step=1000,
                              tooltip="Max tokens per DiT forward (text, references and keyframes when conditioning is connected, one tile x chunk of video, audio). Calibrate from a run that fits in VRAM. The workflow stops when no allowed split fits."),
+                io.Combo.Input("priority", options=["quality", "balance", "speed"], default="quality",
+                               tooltip="quality: fewest tiles, then fewest (longest) time chunks that fit token_budget. speed: over every tile grid and chunk count (chunks >= min_chunk_frames, fitting token_budget), the plan with the lowest estimated sampling time, upgraded to a fewer-tile / longer-chunk plan when that is within 20% of it. balance: the best-quality plan whose estimated time is at most halfway between speed and quality. Per-tile time is a fixed part plus a part quadratic in tokens, so very large tiles and chunks are slow."),
                 io.Boolean.Input("spatial_split", default=True,
                                  tooltip="Allow Tiled Diffusion tiles. Off: the model is passed through unpatched."),
                 io.Float.Input("tile_overlap_frac", default=0.5, min=0.0, max=0.5, step=0.05,
@@ -257,7 +275,7 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, latent, token_budget, spatial_split, tile_overlap_frac, method,
+    def execute(cls, model, latent, token_budget, priority, spatial_split, tile_overlap_frac, method,
                 temporal_split, min_chunk_frames, temporal_overlap_frac, anchor_strength,
                 latent_upscale_param=None, conditioning=None) -> io.NodeOutput:
         _, _, tv, H, W = latent["samples"].tensors[0].shape
@@ -266,23 +284,50 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
         cond_tokens, keyframes = _cond_tokens(conditioning)
 
         plan = None
+        fits = []  # speed / balance: (plan, est cost, tile count) of every fitting plan
         for n_tiles in (TILE_GRIDS if spatial_split else ["1"]):
-            tile_h, tile_w, _ = _solve_tiles(H, W, n_tiles, tile_overlap_frac)
+            tile_h, tile_w, tile_ov = _solve_tiles(H, W, n_tiles, tile_overlap_frac)
+            tile_count = len(_tile_starts(H, tile_h, tile_ov)) * len(_tile_starts(W, tile_w, tile_ov))
             for n in range(1, tv // 5 + 2 if temporal_split else 2):
                 bounds, chunk_length, overlap = _solve_temporal(tv, n, temporal_overlap_frac)
                 if len(bounds) > 1 and chunk_length < min_chunk_frames:
                     break
-                tokens = _max_tokens(bounds, H, W, tile_h, tile_w, cond_tokens, keyframes)
+                per_chunk = _chunk_tokens(bounds, H, W, tile_h, tile_w, cond_tokens, keyframes)
+                tokens = max(sum(p) for p in per_chunk)
                 if plan is None or tokens < plan[0]:
-                    plan = (tokens, n_tiles, bounds, chunk_length, overlap)
+                    plan = (tokens, n_tiles, bounds, chunk_length, overlap, per_chunk)
                 if tokens <= token_budget:
-                    break
-            if plan[0] <= token_budget:
+                    if priority == "quality":
+                        break
+                    if all(f[0][1] != n_tiles or f[0][2] != bounds for f in fits):
+                        fits.append(((tokens, n_tiles, bounds, chunk_length, overlap, per_chunk),
+                                     _plan_cost(tile_count, per_chunk), tile_count))
+            if priority == "quality" and plan[0] <= token_budget:
                 break
-        tokens, n_tiles, bounds, chunk_length, overlap = plan
+        front = []  # fitting plans, best quality first, that no better plan matches in time
+        if fits:
+            best = None
+            for f in sorted(fits, key=lambda f: (f[2], -f[0][3])):  # fewest tiles, then longest chunks
+                if best is None or f[1] * (1 + _NEAR_TIE) < best:
+                    front.append(f)
+                    best = f[1] if best is None else min(best, f[1])
+            fastest = min(front, key=lambda f: f[1])
+            if priority == "speed":
+                chosen = fastest
+            else:  # balance: best quality within half the extra time of quality over speed
+                cap = (fastest[1] + front[0][1]) / 2
+                chosen = next(f for f in front if f[1] <= cap)
+            plan = chosen[0]
+        tokens, n_tiles, bounds, chunk_length, overlap, per_chunk = plan
 
         print(f"[MMH3 Auto Split Planner] {W * 16}x{H * 16}, {frames_for_tokens(tv)} frames, "
-              f"tokens {tokens}/{token_budget}")
+              f"latent {tv}x{H}x{W}, tokens {tokens}/{token_budget}, priority {priority}")
+        if fits:
+            base = front[0][1]  # best quality = the quality pick
+            for f in front:
+                p = f[0]
+                print(f"  {'chosen' if f is chosen else 'option'}: {p[1]} tiles, {len(p[2])} chunks x {p[3]} frames, "
+                      f"tokens {p[0]}, est time x{f[1] / base:.2f} vs quality")
         if n_tiles == "1":
             print("  spatial : 1 tile (bypass)")
         else:
@@ -294,6 +339,8 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
             print("  temporal: 1 chunk (bypass)")
         else:
             print(f"  temporal: {len(bounds)} chunks, {chunk_length} frames/chunk, overlap {overlap} frames")
+        cond, kf, vid, aud = max(per_chunk, key=sum)
+        print(f"  largest : text+refs {cond}, keyframes {kf}, video {vid}, audio {aud} per tile")
         if tokens > token_budget:
             raise ValueError(f"MMH3 Auto Split Planner: no allowed split fits token_budget "
                              f"(smallest needs {tokens} > {token_budget} tokens).")
