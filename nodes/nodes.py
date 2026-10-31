@@ -27,6 +27,7 @@ ltx.py.
 """
 
 import math
+import time
 from enum import Enum
 
 import torch
@@ -1562,13 +1563,42 @@ class MMH3UltimateUpscale(io.ComfyNode):
                                        fun_control_param["upscale_width"])
 
         # High-VRAM fast path: when offload_model is OFF the H3 upscaler stays
-        # resident on the device for the whole pass (no per-chunk unload/reload),
-        # and the diffusion model is not offloaded during upscale either. The
-        # upscaler is then unloaded once at the end. Only the model-based upscaler
-        # node carries 'offload_model'; model-free interpolation has no model.
+        # resident on the device across the up-front chunk upscales (no per-chunk
+        # unload/reload) and is unloaded once before sampling. Only the model-based
+        # upscaler node carries 'offload_model'; model-free interpolation has no model.
         keep_upscaler_resident = (latent_upscale_param is not None
                                   and "model_name" in latent_upscale_param
                                   and not latent_upscale_param.get("offload_model", True))
+
+        # 1. upscale every chunk's video (audio untouched) before any sampling.
+        #    Under dynamic VRAM, unloading H3 between chunks does not release its
+        #    weights, so a per-chunk upscale after sampling has no room. Upscaling
+        #    all chunks first runs the upscaler while H3 is not yet on the GPU; each
+        #    chunk is upscaled from the same low-res slice as before.
+        up_chunks = []
+        if latent_upscale_param is not None:
+            if ("model_name" in latent_upscale_param and not keep_upscaler_resident
+                    and str(latent_upscale_param["device"]) == "cuda" and hasattr(model, "clone_base_uuid")):
+                # H3 may still be on the GPU from an earlier node; offload it so it
+                # and the 3D upscaler don't reside simultaneously
+                comfy.model_management.unload_model_and_clones(model, unload_additional_models=False)
+                comfy.model_management.soft_empty_cache()
+            up_dev = comfy.model_management.get_torch_device()
+            if up_dev.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(up_dev)
+            t_up = time.perf_counter()
+            for k0, f0, k1, f1 in bounds:
+                up_chunks.append(upscale_latent(video[:, :, k0:k1].contiguous(), latent_upscale_param)[0])
+            peak = (f", torch peak reserved {torch.cuda.max_memory_reserved(up_dev) / 1024 ** 3:.2f} GiB"
+                    if up_dev.type == "cuda" else "")
+            print(f"[MMH3 Ultimate Upscale] upscaled {len(bounds)} chunk(s) before sampling "
+                  f"in {time.perf_counter() - t_up:.1f}s{peak}")
+            if keep_upscaler_resident:
+                unload_upscale_model(
+                    latent_upscale_param["model_name"],
+                    latent_upscale_param["device"],
+                    latent_upscale_param["precision"],
+                )
 
         for i, (k0, f0, k1, f1) in enumerate(bounds):
             chunk_v = video[:, :, k0:k1].contiguous()
@@ -1576,21 +1606,10 @@ class MMH3UltimateUpscale(io.ComfyNode):
             a1 = min(a1, ta)
             chunk_a = audio[:, :, :, a0:a1].contiguous()
 
-            # 1. upscale this chunk's video (audio untouched). While the 3D upscaler
-            #    is on the GPU the diffusion model isn't needed, so offload it first
-            #    to avoid H3 + upscaler resident simultaneously; the next sample
-            #    reloads H3 automatically.
-            upscaled = False
-            if latent_upscale_param is not None:
-                use_model = "model_name" in latent_upscale_param
-                if (use_model and not keep_upscaler_resident
-                        and str(latent_upscale_param["device"]) == "cuda" and hasattr(model, "clone_base_uuid")):
-                    # the 3D upscaler is on the GPU during upscale; offload the
-                    # diffusion model so they don't reside simultaneously
-                    comfy.model_management.unload_model_and_clones(model, unload_additional_models=False)
-                    comfy.model_management.soft_empty_cache()
-                chunk_v, _, _ = upscale_latent(chunk_v, latent_upscale_param)
-                upscaled = True
+            # 1. this chunk's upscaled video (done up front, see above)
+            upscaled = latent_upscale_param is not None
+            if upscaled:
+                chunk_v = up_chunks[i]
 
             # 2. time re-anchor; keyframe video latents not on the (possibly
             #    upscaled) chunk's spatial grid are dropped - the H3 packed layout
@@ -1604,6 +1623,10 @@ class MMH3UltimateUpscale(io.ComfyNode):
                 cond_i = anchor_conditioning(cond_i, acc_v, f0, anchor_strength)
 
             # 4. inner loop: spatial split -> sample -> stitch
+            dev = comfy.model_management.get_torch_device()
+            if dev.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(dev)
+            t_start = time.perf_counter()
             fun_control = None
             if fun_control_param is not None:
                 chunk_ctrl, fc_mode = _chunk_fun_control(fun_control_param, f0, f1, fc_buffer)
@@ -1638,6 +1661,10 @@ class MMH3UltimateUpscale(io.ComfyNode):
                 out = sample_piece(piece, cond_i, model, noise, sampler, sigmas, negative, cfg)
                 chunk_out_v = out.tensors[0]
 
+            peak = (f", torch peak reserved {torch.cuda.max_memory_reserved(dev) / 1024 ** 3:.2f} GiB"
+                    if dev.type == "cuda" else "")
+            print(f"[MMH3 Ultimate Upscale] chunk {i}/{len(bounds)} sampled in {time.perf_counter() - t_start:.1f}s{peak}")
+
             # 5. temporal stitch
             acc_v, acc_a = temporal_append(acc_v, acc_a, chunk_out_v, chunk_a, i, k0, f0)
 
@@ -1657,14 +1684,6 @@ class MMH3UltimateUpscale(io.ComfyNode):
         if hasattr(model, "clone_base_uuid"):
             comfy.model_management.unload_model_and_clones(model, unload_additional_models=False)
             comfy.model_management.soft_empty_cache()
-
-        # If the upscaler was kept resident for the full pass, unload it once now
-        if keep_upscaler_resident and latent_upscale_param is not None:
-            unload_upscale_model(
-                latent_upscale_param["model_name"],
-                latent_upscale_param["device"],
-                latent_upscale_param["precision"],
-            )
 
         out = {"samples": comfy.nested_tensor.NestedTensor((acc_v, acc_a))}
         return io.NodeOutput(out, segments_debug, tiles_debug)
