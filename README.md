@@ -39,6 +39,7 @@ MiniMax H3 generates video as a nested latent that bundles 24-channel video **an
 ### Temporal consistency & smooth time transitions
 - **Frame-0 anchor.** At the start of each chunk (except the first), the chunk's frame-0 keyframe is replaced by the previous chunk's re-sampled boundary frame (`anchor_conditioning`, controlled by `anchor_strength`, default `0.999` — mirroring the *Anchor MiniMax H3 Latent* node). This removes detail mismatch at the chunk seam.
 - **Cross-fade stitching.** Overlapping chunks are blended with a linear cross-fade (`temporal_append` / `_crossfade`) over the overlap region, so transitions between chunks are smooth rather than hard-cut.
+- **Per-clip chunks (obvpm joint timelines).** With an *H3 Joint Conditioning* table, chunks are cut per clip (`joint_segments`) so every frame is sampled under its own clip's conditioning. A chunk shorter than `chunk_length` reaches back over already-sampled frames; on the whole-chunk path those frames (before the cross-fade band) are held in place with a `noise_mask` and replace the frame-0 anchor.
 
 ### Pixel-space consistency & smooth spatial transitions
 - **Frozen overlap mask.** Each tile is sampled at its true extent, but the overlap strips it shares with already-stitched neighbors are pre-filled from the accumulated result and locked with a `noise_mask` (`spatial_fade_mask`). The re-sample is therefore only allowed to change the *free* interior; the shared seam content is preserved exactly.

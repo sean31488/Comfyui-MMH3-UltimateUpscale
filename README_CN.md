@@ -39,6 +39,7 @@ MiniMax H3 生成的视频是一个"嵌套潜变量"——把 24 通道的视频
 ### 时序一致性 & 过渡顺滑
 - **首帧锚定（frame-0 anchor）。** 除第一块外，每个时间块的首帧关键帧会被替换为上一块已重采样边界帧（`anchor_conditioning`，由 `anchor_strength` 控制，默认 `0.999`，对应 *Anchor MiniMax H3 Latent* 节点的行为），消除块与块接缝处的细节错位。
 - **交叉淡入淡出拼接（cross-fade）。** 重叠的时间块在重叠区用线性交叉淡变（`temporal_append` / `_crossfade`）混合，块间接缝是平滑过渡而非硬切。
+- **按片段切块（obvpm joint 时间线）。** 接入 *H3 Joint Conditioning* 表时，按片段切块（`joint_segments`），每一帧都用其所属片段的 conditioning 采样。短于 `chunk_length` 的块会向前延伸到已采样的帧；整块路径下这些帧（交叉淡变带之前）用 `noise_mask` 冻结，并取代首帧锚定。
 
 ### 像素空间一致性 & 过渡顺滑
 - **冻结重叠遮罩（frozen overlap mask）。** 每个 tile 都在其真实尺寸上采样，但它与已拼接邻居共享的重叠条带会从累计结果中预填充，并用 `noise_mask`（`spatial_fade_mask`）锁定——重采样只能改变"自由内部"，共享接缝内容被精确保留。

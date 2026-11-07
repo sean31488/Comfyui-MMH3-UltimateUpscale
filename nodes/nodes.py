@@ -130,6 +130,70 @@ def compute_segments(tv, chunk_length, overlap):
     return bounds, frame_count
 
 
+def joint_segments(tv, chunk_length, overlap, cond):
+    """compute_segments, cut per clip of an obvpm joint timeline.
+
+    Returns (bounds, frame_count, clips): with an 'H3 Joint Conditioning'
+    table, every clip gets its own run of chunks from its start over the rows
+    the cut shows of it (as obvpm's anchored_windows), and clips[i] is the
+    clip whose conditioning chunk i samples under, so no chunk samples one
+    clip's rows under another clip's conditioning. A run ends where the next
+    clip's own rows begin; the next run starts `overlap` frames earlier (the
+    sampler's cross-fade band).
+    Chunks are then stretched back to chunk_length over rows already sampled.
+    A single chunk, no table, or a layout off the 5-token cycle keeps the
+    plain split (clips None)."""
+    bounds, frame_count = compute_segments(tv, chunk_length, overlap)
+    table = cond[0][1].get("obvpm_h3_joint") if cond else None
+    owners = table.get("owners") if table else None
+    if len(bounds) == 1 or not owners or len(owners) != tv:
+        return bounds, frame_count, None
+    first = {}
+    for t, j in enumerate(owners):
+        if j >= 0 and j not in first:
+            first[j] = t
+    start = {j: max(0, int(table["spans"][j][0])) for j in first}
+    order = sorted(first, key=lambda j: (start[j], j))
+    if start[order[0]] != 0 or any(s % 5 for s in start.values()):
+        return bounds, frame_count, None
+    ov = tokens_for_frames(overlap)
+    joint, clips = [], []
+    for pos, j in enumerate(order):
+        a = start[j]
+        end = nxt = tv
+        if pos + 1 < len(order):
+            nxt = start[order[pos + 1]]
+            later = [first[o] for o in order[pos + 1:] if first[o] > a]
+            end = min(-(-(min(later) if later else tv) // 5) * 5, tv)
+        if joint:
+            # start `overlap` back over rows already sampled: only that band is
+            # cross-faded, so each clip's rows come from its own conditioning
+            # outside it
+            a = max(0, min(a, (joint[-1][2] - ov) // 5 * 5))
+        if end <= a:
+            continue
+        fa = frames_for_tokens(a)
+        run = [(a + k0, fa + f0, a + k1, fa + f1)
+               for k0, f0, k1, f1 in compute_segments(end - a, chunk_length, overlap)[0]]
+        # a last chunk wholly inside the next clip's run only re-samples its
+        # overlap: let the chunk before reach the run's end instead
+        while len(run) > 1 and run[-1][0] >= nxt:
+            run.pop()
+            run[-1] = run[-1][:2] + (end, frames_for_tokens(end))
+        joint.extend(run)
+        clips.extend([j] * len(run))
+    # a chunk shorter than chunk_length reaches back over finished rows (held
+    # in place by the sampler before its cross-fade band, so their clip's
+    # conditioning does not matter): every chunk but one ending inside the
+    # first chunk_length keeps full context
+    span, prev = tokens_for_frames(chunk_length), -5
+    for i, (k0, f0, k1, f1) in enumerate(joint):
+        k0 = min(k0, max(prev + 5, (k1 - span) // 5 * 5))
+        joint[i] = (k0, frames_for_tokens(k0), k1, f1)
+        prev = k0
+    return joint, frame_count, clips
+
+
 def snap_frame_boundary(f, max_tokens, phase=None):
     """Nearest video-token boundary to pixel frame f (optionally on a phase grid)."""
     step = phase if phase is not None else 1
@@ -536,9 +600,10 @@ def joint_keyframes(table):
     return keyframes
 
 
-def chunk_conditioning(cond, k0, k1):
+def chunk_conditioning(cond, k0, k1, clip=None):
     """The conditioning of the clip an obvpm joint timeline shows most in video
-    tokens [k0, k1) (its 'H3 Joint Conditioning' table); `cond` without one.
+    tokens [k0, k1) (its 'H3 Joint Conditioning' table), or of `clip` when
+    joint_segments assigned one; `cond` without a table.
     Its keyframes become those of joint_keyframes."""
     table = cond[0][1].get("obvpm_h3_joint") if cond else None
     if not table:
@@ -546,7 +611,7 @@ def chunk_conditioning(cond, k0, k1):
     owners = [o for o in table.get("owners", [])[k0:k1] if o >= 0]
     if not owners:
         return cond
-    j = max(sorted(set(owners)), key=owners.count)
+    j = clip if clip is not None else max(sorted(set(owners)), key=owners.count)
     keyframes = joint_keyframes(table)
     print(f"[H3] tokens {k0}..{k1}: conditioning of {table['clips'][j]}, "
           f"keyframes at frames {[kf['resolved_frame_index'] for kf in keyframes]}")
@@ -820,9 +885,10 @@ def _build_fun_net(fun_control, r0, c0, tr, tc, sigmas, sampling):
 # stitching helpers
 # ---------------------------------------------------------------------------
 
-def temporal_append(acc_v, acc_a, chunk_v, chunk_a, index, k0, f0):
+def temporal_append(acc_v, acc_a, chunk_v, chunk_a, index, k0, f0, held=0):
     """Stitch one re-sampled chunk into the accumulated latent (cross-fade).
-    Mirrors 'Append MiniMax H3 Latents'. Returns (result_v, result_a)."""
+    Mirrors 'Append MiniMax H3 Latents'. The video cross-fade skips the first
+    `held` overlap tokens (kept as-is). Returns (result_v, result_a)."""
     if acc_v is None:
         return chunk_v, chunk_a
 
@@ -841,8 +907,9 @@ def temporal_append(acc_v, acc_a, chunk_v, chunk_a, index, k0, f0):
     ov = (acc_v.shape[2] - gi) if index > 0 else 0
     if ov > 0:
         ov = min(ov, v.shape[2])
-        tail = result_v[:, :, gi:gi + ov].clone()
-        result_v[:, :, gi:gi + ov] = _crossfade(tail, v[:, :, :ov], dim=2)
+        h = min(held, ov)
+        tail = result_v[:, :, gi + h:gi + ov].clone()
+        result_v[:, :, gi + h:gi + ov] = _crossfade(tail, v[:, :, h:ov], dim=2)
         v = v[:, :, ov:]
     write_v = gi + max(ov, 0)
     if v.shape[2] > 0:
@@ -1541,11 +1608,12 @@ class MMH3UltimateUpscale(io.ComfyNode):
         if temporal_split_param is not None:
             chunk_length = int(temporal_split_param["chunk_length"])
             overlap = int(temporal_split_param["temporal_overlap"])
-            bounds, frame_count = compute_segments(tv, chunk_length, overlap)
-            anchor_strength = temporal_split_param["anchor_strength"]
+            bounds, frame_count, clips = joint_segments(tv, chunk_length, overlap, conditioning)
+            anchor_strength = temporal_split_param.get("anchor_strength", 0.999)
         else:
             frame_count = frames_for_tokens(tv)
             bounds = [(0, 0, tv, frame_count)]
+            clips = None
             anchor_strength = 0.999
 
         acc_v = None
@@ -1615,12 +1683,19 @@ class MMH3UltimateUpscale(io.ComfyNode):
             #    upscaled) chunk's spatial grid are dropped - the H3 packed layout
             #    requires keyframes on the sampled target's grid, and a resized
             #    low-res keyframe is a blurred anchor that ghosts
-            cond_i = reanchor_conditioning(chunk_conditioning(conditioning, k0, k1), f0, f1,
-                                           (chunk_v.shape[3], chunk_v.shape[4]))
+            cond_i = reanchor_conditioning(chunk_conditioning(conditioning, k0, k1, clips[i] if clips else None),
+                                           f0, f1, (chunk_v.shape[3], chunk_v.shape[4]))
 
-            # 3. pin frame-0 keyframe to the previous chunk's re-sampled frame
+            # 3. the last `overlap` of the band is re-sampled and cross-faded
+            #    (the previous chunk's tail lacks forward context); rows before it
+            #    (stretched chunks, whole-chunk path only) are held in place at the
+            #    previous result. Without held rows, pin frame 0 to that result.
+            held = 0
             if i > 0 and acc_v is not None:
-                cond_i = anchor_conditioning(cond_i, acc_v, f0, anchor_strength)
+                if spatial_split_param is None:
+                    held = max(0, acc_v.shape[2] - k0 - tokens_for_frames(overlap))
+                if held == 0:
+                    cond_i = anchor_conditioning(cond_i, acc_v, f0, anchor_strength)
 
             # 4. inner loop: spatial split -> sample -> stitch
             dev = comfy.model_management.get_torch_device()
@@ -1658,15 +1733,26 @@ class MMH3UltimateUpscale(io.ComfyNode):
                         fun_control["strength"], sigmas, fun_control,
                         getattr(model, "model_sampling", None))
                 piece = {"samples": comfy.nested_tensor.NestedTensor((chunk_v, chunk_a))}
+                if held > 0:
+                    # H3 runs mask-0 rows as clean cond rows in place, so the
+                    # held rows anchor the chunk without extra tokens
+                    chunk_v = chunk_v.clone()
+                    chunk_v[:, :, :held] = acc_v[:, :, k0:k0 + held].to(chunk_v)
+                    mv = torch.ones((1, 1) + tuple(chunk_v.shape[2:]), device=chunk_v.device)
+                    mv[:, :, :held] = 0.0
+                    piece = {
+                        "samples": comfy.nested_tensor.NestedTensor((chunk_v, chunk_a)),
+                        "noise_mask": comfy.nested_tensor.NestedTensor((mv, torch.ones_like(chunk_a))),
+                    }
                 out = sample_piece(piece, cond_i, model, noise, sampler, sigmas, negative, cfg)
                 chunk_out_v = out.tensors[0]
 
             peak = (f", torch peak reserved {torch.cuda.max_memory_reserved(dev) / 1024 ** 3:.2f} GiB"
                     if dev.type == "cuda" else "")
-            print(f"[MMH3 Ultimate Upscale] chunk {i}/{len(bounds)} sampled in {time.perf_counter() - t_start:.1f}s{peak}")
+            print(f"[MMH3 Ultimate Upscale] chunk {i + 1}/{len(bounds)} sampled in {time.perf_counter() - t_start:.1f}s{peak}")
 
             # 5. temporal stitch
-            acc_v, acc_a = temporal_append(acc_v, acc_a, chunk_out_v, chunk_a, i, k0, f0)
+            acc_v, acc_a = temporal_append(acc_v, acc_a, chunk_out_v, chunk_a, i, k0, f0, held)
 
             segments_debug.append({
                 "chunk": i,

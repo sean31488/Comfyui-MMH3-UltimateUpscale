@@ -217,12 +217,11 @@ class _H3TiledDiffusionImpl:
         payload = c.get("minimax_payload")
         if payload is None:
             raise ValueError("MMH3 Tiled Diffusion only works with the MiniMax H3 model.")
-        for k in ("control", "denoise_mask", "audio_denoise_mask"):
-            if c.get(k) is not None:
-                raise ValueError(
-                    f"MMH3 Tiled Diffusion (experimental) does not support '{k}'. "
-                    "Disconnect the fun controlnet / inpaint chain, or use the "
-                    "spatial split path of MMH3 Ultimate Upscale instead.")
+        if c.get("control") is not None:
+            raise ValueError(
+                "MMH3 Tiled Diffusion (experimental) does not support 'control'. "
+                "Disconnect the fun controlnet / inpaint chain, or use the "
+                "spatial split path of MMH3 Ultimate Upscale instead.")
 
         streams = comfy.utils.unpack_latents(x, c["latent_shapes"])
         video, audio = streams[0], streams[1] if len(streams) > 1 else None
@@ -241,6 +240,9 @@ class _H3TiledDiffusionImpl:
             v_t = video[:, :, :, h0:h1, w0:w1]
             c_t = dict(c)
             c_t["minimax_payload"] = p
+            if c.get("denoise_mask") is not None:
+                # the video mask shares the latent grid; audio is whole per tile
+                c_t["denoise_mask"] = c["denoise_mask"][..., h0:h1, w0:w1]
             if audio is not None:
                 x_t, shapes_t = comfy.utils.pack_latents([v_t, audio])
                 c_t["latent_shapes"] = shapes_t

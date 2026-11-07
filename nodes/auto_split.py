@@ -9,7 +9,7 @@ from comfy_api.latest import io
 
 from .h3_latent_upscaler import _compute_upscale_target
 from .nodes import (H3_TEMPORAL_PARAM, H3_UPSCALE_PARAM, audio_range, compute_segments, frames_for_tokens,
-                    joint_keyframes, normalize_minimax_refs, trim_keyframe)
+                    joint_keyframes, joint_segments, normalize_minimax_refs, trim_keyframe)
 from .tiled_diffusion import _H3TiledDiffusionImpl, _ceil2, _tile_starts
 
 # n_tiles -> (tiles along the long edge, tiles along the short edge)
@@ -35,9 +35,10 @@ def _solve_tiles(H, W, n_tiles, overlap_frac):
         ov += 2
 
 
-def _solve_temporal(tv, chunk_count, overlap_frac):
+def _solve_temporal(tv, chunk_count, overlap_frac, conditioning=None):
     """(bounds, chunk_length, temporal_overlap) cutting `tv` video tokens into
-    at most `chunk_count` chunks on the 17-frame grid."""
+    at most `chunk_count` chunks on the 17-frame grid. With an obvpm joint
+    conditioning the bounds are the sampler's per-clip split of that size."""
     frame_count = frames_for_tokens(tv)
     n = chunk_count
     # grow the overlap on the 17-frame grid until it reaches overlap_frac
@@ -51,7 +52,7 @@ def _solve_temporal(tv, chunk_count, overlap_frac):
             chunk_length += 17
             bounds, _ = compute_segments(tv, chunk_length, overlap)
         if overlap >= overlap_frac * chunk_length:
-            return bounds, chunk_length, overlap
+            return joint_segments(tv, chunk_length, overlap, conditioning)[0], chunk_length, overlap
         overlap += 17
 
 
@@ -247,13 +248,13 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
                                        tooltip="The same latent_upscale_param fed into 'MMH3 Ultimate Upscale'. When connected, its width/height is the sampling size; otherwise the latent size is."),
                 io.Conditioning.Input("conditioning", optional=True,
                                       tooltip="The same positive conditioning fed into 'MMH3 Ultimate Upscale'. When connected, its text, references and keyframes count toward token_budget."),
-                io.Int.Input("token_budget", default=44000, min=1000, max=1000000, step=1000,
+                io.Int.Input("token_budget", default=100000, min=1000, max=1000000, step=1000,
                              tooltip="Max tokens per DiT forward (text, references and keyframes when conditioning is connected, one tile x chunk of video, audio). Calibrate from a run that fits in VRAM. The workflow stops when no allowed split fits."),
-                io.Combo.Input("priority", options=["quality", "balance", "speed"], default="quality",
+                io.Combo.Input("priority", options=["quality", "balance", "speed"], default="balance",
                                tooltip="quality: fewest tiles, then fewest (longest) time chunks that fit token_budget. speed: over every tile grid and chunk count (chunks >= min_chunk_frames, fitting token_budget), the plan with the lowest estimated sampling time, upgraded to a fewer-tile / longer-chunk plan when that is within 20% of it. balance: the best-quality plan whose estimated time is at most halfway between speed and quality. Per-tile time is a fixed part plus a part quadratic in tokens, so very large tiles and chunks are slow."),
                 io.Boolean.Input("spatial_split", default=True,
                                  tooltip="Allow Tiled Diffusion tiles. Off: the model is passed through unpatched."),
-                io.Float.Input("tile_overlap_frac", default=0.5, min=0.0, max=0.5, step=0.05,
+                io.Float.Input("tile_overlap_frac", default=0.15, min=0.0, max=0.5, step=0.05,
                                tooltip="Overlap between neighbouring tiles as a fraction of the tile size. Unused when spatial_split is off."),
                 io.Combo.Input("method", options=["gaussian", "uniform"], default="gaussian",
                                tooltip="Tiled Diffusion overlap blending weight, used only when tiles > 1."),
@@ -261,10 +262,8 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
                                  tooltip="Allow time chunks. Off: temporal_split_param is empty."),
                 io.Int.Input("min_chunk_frames", default=119, min=17, max=100000, step=17,
                              tooltip="Shortest allowed time chunk in pixel frames (multiple of 17). Tiles are added instead of cutting time chunks shorter than this. Unused when temporal_split is off."),
-                io.Float.Input("temporal_overlap_frac", default=0.25, min=0.0, max=0.5, step=0.01,
+                io.Float.Input("temporal_overlap_frac", default=0.1, min=0.0, max=0.5, step=0.01,
                                tooltip="Overlap between consecutive chunks as a fraction of the chunk length. Unused when temporal_split is off."),
-                io.Float.Input("anchor_strength", default=0.999, min=0.0, max=1.0, step=0.01,
-                               tooltip="Frame-0 anchor strength of each time chunk, used only when chunks > 1."),
             ],
             outputs=[
                 io.Model.Output("model",
@@ -276,7 +275,7 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, latent, token_budget, priority, spatial_split, tile_overlap_frac, method,
-                temporal_split, min_chunk_frames, temporal_overlap_frac, anchor_strength,
+                temporal_split, min_chunk_frames, temporal_overlap_frac,
                 latent_upscale_param=None, conditioning=None) -> io.NodeOutput:
         _, _, tv, H, W = latent["samples"].tensors[0].shape
         if latent_upscale_param is not None:
@@ -289,7 +288,7 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
             tile_h, tile_w, tile_ov = _solve_tiles(H, W, n_tiles, tile_overlap_frac)
             tile_count = len(_tile_starts(H, tile_h, tile_ov)) * len(_tile_starts(W, tile_w, tile_ov))
             for n in range(1, tv // 5 + 2 if temporal_split else 2):
-                bounds, chunk_length, overlap = _solve_temporal(tv, n, temporal_overlap_frac)
+                bounds, chunk_length, overlap = _solve_temporal(tv, n, temporal_overlap_frac, conditioning)
                 if len(bounds) > 1 and chunk_length < min_chunk_frames:
                     break
                 per_chunk = _chunk_tokens(bounds, H, W, tile_h, tile_w, cond_tokens, keyframes)
@@ -350,5 +349,5 @@ class MMH3AutoSplitPlanner(io.ComfyNode):
             model.set_model_unet_function_wrapper(_AutoTiledDiffusionImpl(method, n_tiles, tile_overlap_frac))
         temporal = None
         if len(bounds) > 1:
-            temporal = {"chunk_length": chunk_length, "temporal_overlap": overlap, "anchor_strength": anchor_strength}
+            temporal = {"chunk_length": chunk_length, "temporal_overlap": overlap}
         return io.NodeOutput(model, temporal)
